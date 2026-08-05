@@ -316,3 +316,114 @@ func waitForEvent(receiver chan []lease.LeaseWatchResult, etype lease.EventType,
 		}
 	}
 }
+
+// TestWatchSubnetRecoversFromCompaction is the single-subnet counterpart to
+// TestWatchSubnetsRecoversFromCompaction. watchSubnet had the same hot-loop:
+// it reconnected at a now-compacted revision forever and never delivered
+// anything again. After the fix it must re-read the lease and resume.
+func TestWatchSubnetRecoversFromCompaction(t *testing.T) {
+	integration.BeforeTestExternal(t)
+
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	client := clus.RandClient()
+	ctx := context.Background()
+
+	r, kvApi := newTestEtcdRegistry(t, ctx, client)
+
+	if _, err := kvApi.Put(ctx, "/coreos.com/network/config",
+		`{ "Network": "10.1.0.0/16", "Backend": { "Type": "host-gw" } }`); err != nil {
+		t.Fatal("Failed to put network config", err)
+	}
+
+	sn := ip.IP4Net{IP: ip.MustParseIP4("10.1.5.0"), PrefixLen: 24}
+	attrs := &lease.LeaseAttrs{PublicIP: ip.MustParseIP4("1.2.3.4")}
+	if _, err := r.createSubnet(ctx, sn, ip.IP6Net{}, attrs, 24*time.Hour); err != nil {
+		t.Fatal("Failed to create subnet lease", err)
+	}
+
+	// Advance the store revision, then compact past it so watching from an old
+	// revision is guaranteed to hit "required revision has been compacted".
+	var compactRev int64
+	for i := 0; i < 5; i++ {
+		resp, err := kvApi.Put(ctx, "/coreos.com/network/_bump", fmt.Sprintf("%d", i))
+		if err != nil {
+			t.Fatal("Failed to bump revision", err)
+		}
+		compactRev = resp.Header.Revision
+	}
+	if _, err := client.Compact(ctx, compactRev); err != nil {
+		t.Fatal("Failed to compact etcd", err)
+	}
+
+	receiver := make(chan []lease.LeaseWatchResult, 16)
+	go func() { _ = r.watchSubnet(ctx, 1, sn, ip.IP6Net{}, receiver) }()
+
+	// Recovery must surface a re-read snapshot carrying the watched lease.
+	if !waitForSnapshot(receiver, sn, 10*time.Second) {
+		t.Fatal("watchSubnet did not recover from compaction with a re-read snapshot")
+	}
+
+	// Renewing the lease produces a live event, proving the watch resumed at a
+	// current revision instead of staying stuck on the compacted one.
+	if _, err := r.updateSubnet(ctx, sn, ip.IP6Net{}, attrs, 24*time.Hour, 0); err != nil {
+		t.Fatal("Failed to update subnet lease", err)
+	}
+	if !waitForEvent(receiver, lease.EventAdded, sn, 10*time.Second) {
+		t.Fatal("watchSubnet did not resume delivering live events after recovery")
+	}
+}
+
+// TestWatchSubnetReportsRemovalAfterCompaction pins the design call: recovery
+// resumes the watch as it already does after an ordinary delete, but a lease
+// deleted below the compaction horizon is reported as a synthesized
+// EventRemoved rather than silently missed. That leaves the "lease revoked,
+// shut down" decision with the caller.
+func TestWatchSubnetReportsRemovalAfterCompaction(t *testing.T) {
+	integration.BeforeTestExternal(t)
+
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	client := clus.RandClient()
+	ctx := context.Background()
+
+	r, kvApi := newTestEtcdRegistry(t, ctx, client)
+
+	if _, err := kvApi.Put(ctx, "/coreos.com/network/config",
+		`{ "Network": "10.1.0.0/16", "Backend": { "Type": "host-gw" } }`); err != nil {
+		t.Fatal("Failed to put network config", err)
+	}
+
+	sn := ip.IP4Net{IP: ip.MustParseIP4("10.1.5.0"), PrefixLen: 24}
+	attrs := &lease.LeaseAttrs{PublicIP: ip.MustParseIP4("1.2.3.4")}
+	if _, err := r.createSubnet(ctx, sn, ip.IP6Net{}, attrs, 24*time.Hour); err != nil {
+		t.Fatal("Failed to create subnet lease", err)
+	}
+
+	// Delete the lease, then compact past the deletion. This is the case the
+	// watch cannot observe directly: the delete event itself is now below the
+	// compaction horizon, so only a re-read can discover it.
+	if _, err := kvApi.Delete(ctx, "/coreos.com/network/subnets/10.1.5.0-24"); err != nil {
+		t.Fatal("Failed to delete subnet lease", err)
+	}
+	var compactRev int64
+	for i := 0; i < 5; i++ {
+		resp, err := kvApi.Put(ctx, "/coreos.com/network/_bump", fmt.Sprintf("%d", i))
+		if err != nil {
+			t.Fatal("Failed to bump revision", err)
+		}
+		compactRev = resp.Header.Revision
+	}
+	if _, err := client.Compact(ctx, compactRev); err != nil {
+		t.Fatal("Failed to compact etcd", err)
+	}
+
+	receiver := make(chan []lease.LeaseWatchResult, 16)
+	go func() { _ = r.watchSubnet(ctx, 1, sn, ip.IP6Net{}, receiver) }()
+
+	if !waitForEvent(receiver, lease.EventRemoved, sn, 10*time.Second) {
+		t.Fatal("watchSubnet did not report the lease as removed after compaction")
+	}
+}
